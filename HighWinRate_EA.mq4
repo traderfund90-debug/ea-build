@@ -1,67 +1,66 @@
 //+------------------------------------------------------------------+
 //|                                             HighWinRate_EA.mq4   |
 //|                                         traderfund90-debug       |
-//|                    High Win Rate EA - Multi-Filter Confirmation   |
+//|                    High Win Rate EA - Multi-Filter + Retest      |
 //+------------------------------------------------------------------+
 #property copyright "traderfund90-debug"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 //--- Input Parameters
-extern double RiskPercent       = 1.0;    // Risk % per trade
-extern double RR_Ratio          = 2.0;    // Risk:Reward Ratio (TP = RR * SL)
-extern int    MagicNumber       = 202600; // Magic Number
-extern int    MaxOpenTrades     = 1;      // Max open trades at once
-extern int    Slippage          = 3;      // Slippage in pips
+extern double RiskPercent          = 1.0;   // Risk % per trade
+extern double RR_Ratio             = 2.0;   // Risk:Reward Ratio
+extern int    MagicNumber          = 202600;
+extern int    MaxOpenTrades        = 1;
+extern int    Slippage             = 3;
 
-extern int    EMA_Fast          = 21;     // Fast EMA period
-extern int    EMA_Slow          = 50;     // Slow EMA period
-extern int    EMA_Trend         = 200;    // Trend EMA period
+extern int    EMA_Fast             = 21;
+extern int    EMA_Slow             = 50;
+extern int    EMA_Trend            = 200;
 
-extern int    RSI_Period        = 14;     // RSI period
-extern double RSI_OB            = 60.0;  // RSI buy threshold (above)
-extern double RSI_OS            = 40.0;  // RSI sell threshold (below)
+extern int    RSI_Period           = 14;
+extern double RSI_OB               = 60.0;  // RSI buy threshold
+extern double RSI_OS               = 40.0;  // RSI sell threshold
 
-extern int    ATR_Period        = 14;     // ATR period
-extern double ATR_Multiplier    = 1.5;    // ATR multiplier for SL
+extern int    ATR_Period           = 14;
+extern double ATR_Multiplier       = 1.5;   // ATR x for fallback SL
 
-extern bool   UseLondonSession  = true;   // Trade London session (08:00-17:00 GMT)
-extern bool   UseNewYorkSession = true;   // Trade New York session (13:00-22:00 GMT)
+// Retest settings
+extern bool   UseRetestEntry       = true;  // Wait for EMA retest before entering
+extern int    MaxRetestBars        = 10;    // Cancel retest signal after N bars
+extern double RetestATRTolerance   = 0.5;  // How close price must get to fast EMA (ATR units)
 
-//--- Global variables
-datetime lastBarTime = 0;
+extern bool   UseLondonSession     = true;
+extern bool   UseNewYorkSession    = true;
 
-//+------------------------------------------------------------------+
-//| Expert initialization                                            |
+//--- State
+datetime lastBarTime    = 0;
+bool     waitBullRetest = false;
+bool     waitBearRetest = false;
+int      bullRetestBars = 0;
+int      bearRetestBars = 0;
+
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("HighWinRate EA (MT4) initialized on ", Symbol());
+   Print("HighWinRate EA v1.10 (MT4) initialized | Retest=",
+         (UseRetestEntry ? "ON" : "OFF"), " MaxBars=", MaxRetestBars);
    return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization                                          |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason) {}
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
 void OnTick()
 {
-   // Only process on new H1 bar
    datetime currentBar = iTime(Symbol(), PERIOD_H1, 0);
    if(currentBar == lastBarTime) return;
    lastBarTime = currentBar;
 
-   // Session filter
    if(!IsValidSession()) return;
-
-   // Count open positions
    if(CountOpenOrders() >= MaxOpenTrades) return;
 
-   // Indicator values (index 1 = last closed bar, index 2 = bar before that)
+   // --- Indicator values on last closed bar (index 1) and one before (index 2)
    double fastNow  = iMA(Symbol(), PERIOD_H1, EMA_Fast,  0, MODE_EMA, PRICE_CLOSE, 1);
    double fastPrev = iMA(Symbol(), PERIOD_H1, EMA_Fast,  0, MODE_EMA, PRICE_CLOSE, 2);
    double slowNow  = iMA(Symbol(), PERIOD_H1, EMA_Slow,  0, MODE_EMA, PRICE_CLOSE, 1);
@@ -70,61 +69,199 @@ void OnTick()
    double rsiNow   = iRSI(Symbol(), PERIOD_H1, RSI_Period, PRICE_CLOSE, 1);
    double atrNow   = iATR(Symbol(), PERIOD_H1, ATR_Period, 1);
 
-   // EMA crossover detection
-   bool bullCross = (fastPrev < slowPrev) && (fastNow > slowNow);
-   bool bearCross = (fastPrev > slowPrev) && (fastNow < slowNow);
+   double closeLast = iClose(Symbol(), PERIOD_H1, 1);
+   double lowLast   = iLow (Symbol(), PERIOD_H1, 1);
+   double highLast  = iHigh(Symbol(), PERIOD_H1, 1);
 
    double ask = Ask;
    double bid = Bid;
 
-   bool aboveTrend = ask > trendNow;
-   bool belowTrend = bid < trendNow;
+   bool bullCross = (fastPrev < slowPrev) && (fastNow > slowNow);
+   bool bearCross = (fastPrev > slowPrev) && (fastNow < slowNow);
 
-   // BUY Signal: Bullish EMA cross + price above 200 EMA + RSI above threshold
-   if(bullCross && aboveTrend && rsiNow > RSI_OB)
+   // --- Crossover detected: set retest pending or enter immediately
+   if(bullCross)
    {
-      double sl   = ask - (atrNow * ATR_Multiplier);
-      double tp   = ask + (atrNow * ATR_Multiplier * RR_Ratio);
-      double lots = CalculateLotSize(ask - sl);
+      bearRetestBars = 0;
+      waitBearRetest = false;
 
-      sl = NormalizeDouble(sl, Digits);
-      tp = NormalizeDouble(tp, Digits);
-
-      if(lots > 0)
+      if(UseRetestEntry)
       {
-         int ticket = OrderSend(Symbol(), OP_BUY, lots, ask, Slippage, sl, tp,
-                                "HWR_Buy", MagicNumber, 0, clrBlue);
-         if(ticket < 0)
-            Print("BUY OrderSend failed, error: ", GetLastError());
-         else
-            Print("BUY opened: RSI=", DoubleToStr(rsiNow, 2),
-                  " ATR=", DoubleToStr(atrNow, 5),
-                  " Lots=", DoubleToStr(lots, 2));
+         waitBullRetest = true;
+         bullRetestBars = 0;
+         Print("BULL cross detected - waiting for EMA retest (max ", MaxRetestBars, " bars)");
+      }
+      else if(ask > trendNow && rsiNow > RSI_OB)
+      {
+         OpenBuy(ask, atrNow, rsiNow);
       }
    }
 
-   // SELL Signal: Bearish EMA cross + price below 200 EMA + RSI below threshold
-   if(bearCross && belowTrend && rsiNow < RSI_OS)
+   if(bearCross)
    {
-      double sl   = bid + (atrNow * ATR_Multiplier);
-      double tp   = bid - (atrNow * ATR_Multiplier * RR_Ratio);
-      double lots = CalculateLotSize(sl - bid);
+      bullRetestBars = 0;
+      waitBullRetest = false;
 
-      sl = NormalizeDouble(sl, Digits);
-      tp = NormalizeDouble(tp, Digits);
-
-      if(lots > 0)
+      if(UseRetestEntry)
       {
-         int ticket = OrderSend(Symbol(), OP_SELL, lots, bid, Slippage, sl, tp,
-                                "HWR_Sell", MagicNumber, 0, clrRed);
-         if(ticket < 0)
-            Print("SELL OrderSend failed, error: ", GetLastError());
-         else
-            Print("SELL opened: RSI=", DoubleToStr(rsiNow, 2),
-                  " ATR=", DoubleToStr(atrNow, 5),
-                  " Lots=", DoubleToStr(lots, 2));
+         waitBearRetest = true;
+         bearRetestBars = 0;
+         Print("BEAR cross detected - waiting for EMA retest (max ", MaxRetestBars, " bars)");
+      }
+      else if(bid < trendNow && rsiNow < RSI_OS)
+      {
+         OpenSell(bid, atrNow, rsiNow);
       }
    }
+
+   // --- Retest logic: check each bar after the cross
+   if(UseRetestEntry)
+   {
+      // BULL RETEST
+      if(waitBullRetest && !bullCross)
+      {
+         bullRetestBars++;
+
+         double tolerance = atrNow * RetestATRTolerance;
+
+         // Retest condition: bar's low came down to touch the fast EMA zone
+         bool retested = (lowLast <= fastNow + tolerance);
+         // Bounce condition: closed above fast EMA (bullish reaction)
+         bool bounced  = (closeLast > fastNow);
+
+         if(retested && bounced)
+         {
+            Print("BULL retest confirmed on bar ", bullRetestBars,
+                  " | Low=", DoubleToStr(lowLast,5),
+                  " FastEMA=", DoubleToStr(fastNow,5));
+
+            if(ask > trendNow && rsiNow > RSI_OB)
+            {
+               // SL = below retest bar low (more precise than ATR alone)
+               double slFromRetest = lowLast - atrNow * 0.2;
+               double slFromATR    = ask - atrNow * ATR_Multiplier;
+               // Use whichever gives a wider (safer) SL
+               double sl = MathMin(slFromRetest, slFromATR);
+               OpenBuyWithSL(ask, sl, atrNow, rsiNow);
+            }
+            else
+               Print("BULL retest: trend/RSI filter blocked entry");
+
+            waitBullRetest = false;
+            bullRetestBars = 0;
+         }
+         else if(bullRetestBars >= MaxRetestBars)
+         {
+            Print("BULL retest expired after ", MaxRetestBars, " bars - signal cancelled");
+            waitBullRetest = false;
+            bullRetestBars = 0;
+         }
+      }
+
+      // BEAR RETEST
+      if(waitBearRetest && !bearCross)
+      {
+         bearRetestBars++;
+
+         double tolerance = atrNow * RetestATRTolerance;
+
+         // Retest condition: bar's high came back up to touch the fast EMA zone
+         bool retested = (highLast >= fastNow - tolerance);
+         // Rejection condition: closed below fast EMA (bearish reaction)
+         bool rejected = (closeLast < fastNow);
+
+         if(retested && rejected)
+         {
+            Print("BEAR retest confirmed on bar ", bearRetestBars,
+                  " | High=", DoubleToStr(highLast,5),
+                  " FastEMA=", DoubleToStr(fastNow,5));
+
+            if(bid < trendNow && rsiNow < RSI_OS)
+            {
+               // SL = above retest bar high
+               double slFromRetest = highLast + atrNow * 0.2;
+               double slFromATR    = bid + atrNow * ATR_Multiplier;
+               double sl = MathMax(slFromRetest, slFromATR);
+               OpenSellWithSL(bid, sl, atrNow, rsiNow);
+            }
+            else
+               Print("BEAR retest: trend/RSI filter blocked entry");
+
+            waitBearRetest = false;
+            bearRetestBars = 0;
+         }
+         else if(bearRetestBars >= MaxRetestBars)
+         {
+            Print("BEAR retest expired after ", MaxRetestBars, " bars - signal cancelled");
+            waitBearRetest = false;
+            bearRetestBars = 0;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY (immediate cross entry, ATR-based SL)                   |
+//+------------------------------------------------------------------+
+void OpenBuy(double ask, double atrNow, double rsiNow)
+{
+   double sl   = ask - (atrNow * ATR_Multiplier);
+   OpenBuyWithSL(ask, sl, atrNow, rsiNow);
+}
+
+//+------------------------------------------------------------------+
+//| Open BUY with explicit SL                                        |
+//+------------------------------------------------------------------+
+void OpenBuyWithSL(double ask, double sl, double atrNow, double rsiNow)
+{
+   double slDist = ask - sl;
+   double tp     = NormalizeDouble(ask + slDist * RR_Ratio, Digits);
+   sl            = NormalizeDouble(sl, Digits);
+   double lots   = CalculateLotSize(slDist);
+
+   if(lots <= 0) return;
+
+   int ticket = OrderSend(Symbol(), OP_BUY, lots, ask, Slippage, sl, tp,
+                          "HWR_Buy", MagicNumber, 0, clrBlue);
+   if(ticket < 0)
+      Print("BUY OrderSend failed, error: ", GetLastError());
+   else
+      Print("BUY opened | RSI=", DoubleToStr(rsiNow,2),
+            " SL=", DoubleToStr(sl,5),
+            " TP=", DoubleToStr(tp,5),
+            " Lots=", DoubleToStr(lots,2));
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL (immediate cross entry, ATR-based SL)                  |
+//+------------------------------------------------------------------+
+void OpenSell(double bid, double atrNow, double rsiNow)
+{
+   double sl   = bid + (atrNow * ATR_Multiplier);
+   OpenSellWithSL(bid, sl, atrNow, rsiNow);
+}
+
+//+------------------------------------------------------------------+
+//| Open SELL with explicit SL                                       |
+//+------------------------------------------------------------------+
+void OpenSellWithSL(double bid, double sl, double atrNow, double rsiNow)
+{
+   double slDist = sl - bid;
+   double tp     = NormalizeDouble(bid - slDist * RR_Ratio, Digits);
+   sl            = NormalizeDouble(sl, Digits);
+   double lots   = CalculateLotSize(slDist);
+
+   if(lots <= 0) return;
+
+   int ticket = OrderSend(Symbol(), OP_SELL, lots, bid, Slippage, sl, tp,
+                          "HWR_Sell", MagicNumber, 0, clrRed);
+   if(ticket < 0)
+      Print("SELL OrderSend failed, error: ", GetLastError());
+   else
+      Print("SELL opened | RSI=", DoubleToStr(rsiNow,2),
+            " SL=", DoubleToStr(sl,5),
+            " TP=", DoubleToStr(tp,5),
+            " Lots=", DoubleToStr(lots,2));
 }
 
 //+------------------------------------------------------------------+
@@ -163,7 +300,6 @@ double CalculateLotSize(double slPoints)
          " Floored=", DoubleToStr(lots,2),
          " MinLot=",  DoubleToStr(minLot,2));
 
-   // Do NOT force minLot — if risk doesn't afford minimum lot, skip the trade
    if(lots < minLot) { Print("LotCalc: lots<minLot (", DoubleToStr(lots,4), "), skip trade"); return 0; }
 
    lots = MathMin(maxLot, lots);
@@ -177,13 +313,9 @@ int CountOpenOrders()
 {
    int count = 0;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
       if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
-      {
          if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber)
             count++;
-      }
-   }
    return count;
 }
 
@@ -192,12 +324,9 @@ int CountOpenOrders()
 //+------------------------------------------------------------------+
 bool IsValidSession()
 {
-   datetime gmtTime = TimeGMT();
-   int hour = TimeHour(gmtTime);
-
+   int hour     = TimeHour(TimeGMT());
    bool london  = UseLondonSession  && (hour >= 8  && hour < 17);
    bool newyork = UseNewYorkSession && (hour >= 13 && hour < 22);
-
    return (london || newyork);
 }
 //+------------------------------------------------------------------+
