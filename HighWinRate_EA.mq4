@@ -132,7 +132,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 double CalculateLotSize(double slPoints)
 {
-   if(slPoints <= 0) return 0;
+   if(slPoints <= 0) { Print("LotCalc: slPoints<=0, skip"); return 0; }
 
    double accountBalance = AccountBalance();
    double riskAmount     = accountBalance * RiskPercent / 100.0;
@@ -142,15 +142,31 @@ double CalculateLotSize(double slPoints)
    double minLot         = MarketInfo(Symbol(), MODE_MINLOT);
    double maxLot         = MarketInfo(Symbol(), MODE_MAXLOT);
 
-   if(tickValue == 0 || tickSize == 0) return 0;
+   Print("LotCalc | Balance=", DoubleToStr(accountBalance,2),
+         " Risk%=", DoubleToStr(RiskPercent,1),
+         " RiskAmt=", DoubleToStr(riskAmount,2),
+         " SLdist=", DoubleToStr(slPoints,5),
+         " TickVal=", DoubleToStr(tickValue,5),
+         " TickSz=",  DoubleToStr(tickSize,5));
+
+   if(accountBalance <= 0) { Print("LotCalc: AccountBalance=0, skip trade"); return 0; }
+   if(tickValue == 0 || tickSize == 0) { Print("LotCalc: tickValue/tickSize=0, skip"); return 0; }
 
    double valuePerLot = (slPoints / tickSize) * tickValue;
-   if(valuePerLot <= 0) return 0;
+   if(valuePerLot <= 0) { Print("LotCalc: valuePerLot<=0, skip"); return 0; }
 
-   double lots = riskAmount / valuePerLot;
-   lots = MathFloor(lots / lotStep) * lotStep;
-   lots = MathMax(minLot, MathMin(maxLot, lots));
+   double rawLots = riskAmount / valuePerLot;
+   double lots    = MathFloor(rawLots / lotStep) * lotStep;
 
+   Print("LotCalc | ValPerLot=", DoubleToStr(valuePerLot,2),
+         " RawLots=", DoubleToStr(rawLots,4),
+         " Floored=", DoubleToStr(lots,2),
+         " MinLot=",  DoubleToStr(minLot,2));
+
+   // Do NOT force minLot — if risk doesn't afford minimum lot, skip the trade
+   if(lots < minLot) { Print("LotCalc: lots<minLot (", DoubleToStr(lots,4), "), skip trade"); return 0; }
+
+   lots = MathMin(maxLot, lots);
    return NormalizeDouble(lots, 2);
 }
 
